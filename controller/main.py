@@ -1,11 +1,18 @@
+import hashlib
+import json
 import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, File, Form, Response, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import db
+import placement
 import repair
-from config import REPLICATION
+from config import CHUNK_SIZE, REPLICATION
 
 app = FastAPI()
 
@@ -183,3 +190,146 @@ def admin_status(detail: bool = False):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "controller"}
+
+
+# --------------- public api (/api/v1) ---------------
+
+def _read_exact(file_obj, n: int) -> bytes:
+    data = bytearray()
+    while len(data) < n:
+        packet = file_obj.read(n - len(data))
+        if not packet:
+            break
+        data.extend(packet)
+    return bytes(data)
+
+
+@app.post("/api/v1/objects", status_code=201)
+@app.post("/objects", status_code=201)
+def upload_object(
+    file: UploadFile = File(...),
+    metadata: Optional[str] = Form(None),
+):
+    # Reject before inserting object row if fewer than 2 workers alive
+    alive_workers = db.execute("SELECT COUNT(*) AS cnt FROM workers WHERE status = 'ALIVE'")
+    if not alive_workers or alive_workers[0]["cnt"] < REPLICATION:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "SERVICE_UNAVAILABLE", "message": "fewer than 2 workers alive"}},
+        )
+
+    # Validate metadata JSON if provided
+    custom_meta = {}
+    if metadata is not None and metadata.strip() != "":
+        try:
+            parsed = json.loads(metadata)
+            if not isinstance(parsed, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"code": "INVALID_METADATA", "message": "metadata must be a JSON object"}},
+                )
+            custom_meta = parsed
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "INVALID_METADATA", "message": "invalid metadata JSON"}},
+            )
+
+    # Reject before inserting object row if file size is 0
+    first_chunk = _read_exact(file.file, CHUNK_SIZE)
+    if not first_chunk or len(first_chunk) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "EMPTY_FILE", "message": "file is empty"}},
+        )
+
+    object_id = str(uuid.uuid4())
+    filename = file.filename or "unnamed"
+    content_type = file.content_type or "application/octet-stream"
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Insert object(status=UPLOADING)
+    db.execute(
+        """
+        INSERT INTO objects (object_id, name, size, content_type, created_at, modified_at, checksum, num_chunks, custom_meta, status)
+        VALUES (?, ?, 0, ?, ?, ?, '', 0, ?, 'UPLOADING')
+        """,
+        (object_id, filename, content_type, created_at, created_at, json.dumps(custom_meta)),
+        commit=True,
+    )
+
+    placed_tracker = []
+    total_size = 0
+    object_hasher = hashlib.sha256()
+    idx = 0
+    current_chunk = first_chunk
+
+    try:
+        while current_chunk:
+            chunk_size = len(current_chunk)
+            total_size += chunk_size
+            object_hasher.update(current_chunk)
+            chunk_checksum = hashlib.sha256(current_chunk).hexdigest()
+            chunk_id = f"{object_id}_{idx}"
+
+            # Place chunk on 2 workers
+            placed_workers = placement.place_chunk(chunk_id, current_chunk, chunk_checksum, placed_tracker)
+
+            # Insert chunk + replica rows
+            db.execute(
+                "INSERT INTO chunks (chunk_id, object_id, idx, size, checksum) VALUES (?, ?, ?, ?, ?)",
+                (chunk_id, object_id, idx, chunk_size, chunk_checksum),
+                commit=True,
+            )
+            for w in placed_workers:
+                db.execute(
+                    "INSERT INTO replicas (chunk_id, worker_id) VALUES (?, ?)",
+                    (chunk_id, w["worker_id"]),
+                    commit=True,
+                )
+
+            idx += 1
+            current_chunk = _read_exact(file.file, CHUNK_SIZE)
+
+        # After the last chunk set size, checksum, num_chunks, status=COMPLETE
+        object_checksum = object_hasher.hexdigest()
+        num_chunks = idx
+        modified_at = datetime.now(timezone.utc).isoformat()
+
+        db.execute(
+            """
+            UPDATE objects
+            SET size = ?, checksum = ?, num_chunks = ?, status = 'COMPLETE', modified_at = ?
+            WHERE object_id = ?
+            """,
+            (total_size, object_checksum, num_chunks, modified_at, object_id),
+            commit=True,
+        )
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "object_id": object_id,
+                "name": filename,
+                "size": total_size,
+                "content_type": content_type,
+                "created_at": created_at,
+                "modified_at": modified_at,
+                "checksum": object_checksum,
+                "num_chunks": num_chunks,
+                "custom_meta": custom_meta,
+                "status": "COMPLETE",
+            },
+        )
+    except Exception as exc:
+        print(f"[controller] event=upload_failed object_id={object_id} error={exc}")
+        placement.rollback_upload(object_id, placed_tracker)
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "SERVICE_UNAVAILABLE", "message": f"upload failed: {exc}"}},
+        )
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
