@@ -1,0 +1,79 @@
+services:
+  controller:
+    build: ./controller
+    ports:
+      - "8000:8000"
+    volumes:
+      - controller_data:/data
+    networks:
+      - store
+
+  worker1:
+    build: ./worker
+    ports:
+      - "8001:8000"
+    environment:
+      - WORKER_ID=worker1
+      - WORKER_URL=http://worker1:8000
+      - CONTROLLER_URL=http://controller:8000
+    volumes:
+      - worker1_data:/data
+    depends_on:
+      - controller
+    networks:
+      - store
+
+  worker2:
+    build: ./worker
+    ports:
+      - "8002:8000"
+    environment:
+      - WORKER_ID=worker2
+      - WORKER_URL=http://worker2:8000
+      - CONTROLLER_URL=http://controller:8000
+    volumes:
+      - worker2_data:/data
+    depends_on:
+      - controller
+    networks:
+      - store
+
+  worker3:
+    build: ./worker
+    ports:
+      - "8003:8000"
+    environment:
+      - WORKER_ID=worker3
+      - WORKER_URL=http://worker3:8000
+      - CONTROLLER_URL=http://controller:8000
+    volumes:
+      - worker3_data:/data
+    depends_on:
+      - controller
+    networks:
+      - store
+
+  worker4:
+    build: ./worker
+    ports:
+      - "8004:8000"
+    environment:
+      - WORKER_ID=worker4
+      - WORKER_URL=http://worker4:8000
+      - CONTROLLER_URL=http://controller:8000
+    volumes:
+      - worker4_data:/data
+    depends_on:
+      - controller
+    networks:
+      - store
+
+volumes:
+  controller_data:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
+
+networks:
+  store:
