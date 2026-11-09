@@ -22,4 +22,5 @@ controller/*.db-shm
 
 # === misc ===
 .DS_Store
+out.bin
 big.bin
