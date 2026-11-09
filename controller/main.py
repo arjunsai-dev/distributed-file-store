@@ -5,8 +5,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, File, Form, Response, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import db
@@ -333,3 +334,269 @@ def upload_object(
             file.file.close()
         except Exception:
             pass
+
+
+# --------------- helpers for download ---------------
+
+def _get_object_or_error(object_id: str):
+    """Return (obj_row, None) or (None, JSONResponse)."""
+    rows = db.execute(
+        "SELECT * FROM objects WHERE object_id = ?",
+        (object_id,),
+    )
+    if not rows:
+        return None, JSONResponse(
+            status_code=404,
+            content={"error": {"code": "NOT_FOUND", "message": "object not found"}},
+        )
+    obj = rows[0]
+    if obj["status"] == "UPLOADING":
+        return None, JSONResponse(
+            status_code=409,
+            content={"error": {"code": "CONFLICT", "message": "object is still uploading"}},
+        )
+    if obj["status"] == "DELETING":
+        return None, JSONResponse(
+            status_code=404,
+            content={"error": {"code": "NOT_FOUND", "message": "object not found"}},
+        )
+    return obj, None
+
+
+def _fetch_chunk_verified(chunk_row) -> bytes | None:
+    """
+    Try each ALIVE replica for this chunk; return verified bytes or None.
+    """
+    replicas = db.execute(
+        "SELECT r.worker_id, w.url, w.status "
+        "FROM replicas r JOIN workers w ON r.worker_id = w.worker_id "
+        "WHERE r.chunk_id = ? AND w.status = 'ALIVE'",
+        (chunk_row["chunk_id"],),
+    )
+    for rep in replicas:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                res = client.get(f"{rep['url']}/internal/chunks/{chunk_row['chunk_id']}")
+            if res.status_code != 200:
+                continue
+            data = res.content
+            if hashlib.sha256(data).hexdigest() == chunk_row["checksum"]:
+                return data
+            else:
+                print(
+                    f"[controller] event=corruption_detected "
+                    f"chunk_id={chunk_row['chunk_id']} worker_id={rep['worker_id']}"
+                )
+        except Exception as exc:
+            print(
+                f"[controller] event=chunk_fetch_failed "
+                f"chunk_id={chunk_row['chunk_id']} worker_id={rep['worker_id']} error={exc}"
+            )
+    return None
+
+
+# --------------- Task 5: GET /api/v1/objects/{object_id} ---------------
+
+@app.get("/api/v1/objects/{object_id}")
+def download_object(object_id: str):
+    obj, err = _get_object_or_error(object_id)
+    if err:
+        return err
+
+    chunks = db.execute(
+        "SELECT * FROM chunks WHERE object_id = ? ORDER BY idx",
+        (object_id,),
+    )
+    if not chunks:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "NO_VALID_REPLICA", "message": "no chunks found"}},
+        )
+
+    # Fetch chunk 0 BEFORE sending headers so a failure can return 503
+    chunk0_data = _fetch_chunk_verified(chunks[0])
+    if chunk0_data is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "NO_VALID_REPLICA", "message": "cannot retrieve chunk 0"}},
+        )
+
+    def _stream():
+        # Yield chunk 0 (already fetched)
+        yield chunk0_data
+        # Stream remaining chunks
+        for ch in chunks[1:]:
+            data = _fetch_chunk_verified(ch)
+            if data is None:
+                # Mid-stream failure — can't change status code now
+                print(
+                    f"[controller] event=download_chunk_failed "
+                    f"chunk_id={ch['chunk_id']} object_id={object_id}"
+                )
+                return
+            yield data
+
+    content_type = obj["content_type"] or "application/octet-stream"
+    filename = obj["name"] or "download"
+
+    return StreamingResponse(
+        _stream(),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(obj["size"]),
+        },
+    )
+
+
+# --------------- Task 6: metadata, list, delete ---------------
+
+@app.get("/api/v1/objects/{object_id}/metadata")
+def get_object_metadata(object_id: str):
+    obj, err = _get_object_or_error(object_id)
+    if err:
+        return err
+
+    chunks = db.execute(
+        "SELECT chunk_id, idx, size, checksum FROM chunks WHERE object_id = ? ORDER BY idx",
+        (object_id,),
+    )
+    chunk_list = []
+    for ch in chunks:
+        replicas = db.execute(
+            "SELECT r.worker_id, w.status "
+            "FROM replicas r JOIN workers w ON r.worker_id = w.worker_id "
+            "WHERE r.chunk_id = ?",
+            (ch["chunk_id"],),
+        )
+        chunk_list.append({
+            "chunk_id": ch["chunk_id"],
+            "index": ch["idx"],
+            "size": ch["size"],
+            "checksum": ch["checksum"],
+            "replicas": [
+                {"worker_id": r["worker_id"], "alive": r["status"] == "ALIVE"}
+                for r in replicas
+            ],
+        })
+
+    custom_meta = {}
+    try:
+        custom_meta = json.loads(obj["custom_meta"]) if obj["custom_meta"] else {}
+    except Exception:
+        pass
+
+    return {
+        "object_id": obj["object_id"],
+        "name": obj["name"],
+        "size": obj["size"],
+        "content_type": obj["content_type"],
+        "created_at": obj["created_at"],
+        "modified_at": obj["modified_at"],
+        "checksum": obj["checksum"],
+        "num_chunks": obj["num_chunks"],
+        "status": obj["status"],
+        "custom_meta": custom_meta,
+        "chunks": chunk_list,
+    }
+
+
+@app.patch("/api/v1/objects/{object_id}/metadata")
+def patch_object_metadata(object_id: str, body: dict):
+    obj, err = _get_object_or_error(object_id)
+    if err:
+        return err
+
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "INVALID_BODY", "message": "body must be a JSON object"}},
+        )
+
+    # Merge into custom_meta; null value deletes the key
+    try:
+        custom_meta = json.loads(obj["custom_meta"]) if obj["custom_meta"] else {}
+    except Exception:
+        custom_meta = {}
+
+    for k, v in body.items():
+        if v is None:
+            custom_meta.pop(k, None)
+        else:
+            custom_meta[k] = v
+
+    modified_at = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "UPDATE objects SET custom_meta = ?, modified_at = ? WHERE object_id = ?",
+        (json.dumps(custom_meta), modified_at, object_id),
+        commit=True,
+    )
+
+    return {"status": "ok", "custom_meta": custom_meta, "modified_at": modified_at}
+
+
+@app.get("/api/v1/objects")
+def list_objects(limit: int = 100, offset: int = 0):
+    rows = db.execute(
+        "SELECT object_id, name, size, content_type "
+        "FROM objects WHERE status = 'COMPLETE' "
+        "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    )
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/v1/objects/{object_id}", status_code=204)
+def delete_object(object_id: str):
+    rows = db.execute(
+        "SELECT * FROM objects WHERE object_id = ?",
+        (object_id,),
+    )
+    if not rows:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "NOT_FOUND", "message": "object not found"}},
+        )
+    obj = rows[0]
+    if obj["status"] == "UPLOADING":
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"code": "CONFLICT", "message": "object is still uploading"}},
+        )
+
+    # Set status=DELETING so concurrent reads see 404
+    db.execute(
+        "UPDATE objects SET status = 'DELETING' WHERE object_id = ?",
+        (object_id,),
+        commit=True,
+    )
+
+    # Get replicas on ALIVE workers to delete chunks from
+    replica_info = db.execute(
+        "SELECT r.chunk_id, w.worker_id, w.url "
+        "FROM replicas r "
+        "JOIN chunks c ON r.chunk_id = c.chunk_id "
+        "JOIN workers w ON r.worker_id = w.worker_id "
+        "WHERE c.object_id = ? AND w.status = 'ALIVE'",
+        (object_id,),
+    )
+
+    # Remove DB rows first (so reads stop)
+    db.execute_many([
+        ("DELETE FROM replicas WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE object_id = ?)", (object_id,)),
+        ("DELETE FROM chunks WHERE object_id = ?", (object_id,)),
+        ("DELETE FROM objects WHERE object_id = ?", (object_id,)),
+    ], commit=True)
+
+    # Then delete chunks from ALIVE workers
+    with httpx.Client(timeout=5.0) as client:
+        for rep in replica_info:
+            try:
+                client.delete(f"{rep['url']}/internal/chunks/{rep['chunk_id']}")
+            except Exception as exc:
+                print(
+                    f"[controller] event=delete_chunk_failed "
+                    f"chunk_id={rep['chunk_id']} worker_id={rep['worker_id']} error={exc}"
+                )
+
+    return Response(status_code=204)
