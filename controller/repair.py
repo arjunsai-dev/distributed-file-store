@@ -6,7 +6,9 @@ import httpx
 
 import db
 import placement
-from config import DEAD_AFTER, REPAIR_INTERVAL, REPLICATION
+from config import DEAD_AFTER, REPAIR_INTERVAL, REPLICATION, SCRUB_INTERVAL
+
+_repair_lock = threading.Lock()
 
 _repair_lock = threading.Lock()
 
@@ -203,4 +205,107 @@ def _monitor_loop():
 def start_monitor():
     """Start the background monitor thread."""
     t = threading.Thread(target=_monitor_loop, daemon=True)
+    t.start()
+
+
+# --------------- SCRUBBER ---------------
+
+def _scrub_loop():
+    """Every SCRUB_INTERVAL: check every replica's checksum on disk.
+    Mismatch or 404 → delete replica row (repair loop will restore it).
+    """
+    while True:
+        time.sleep(SCRUB_INTERVAL)
+        try:
+            replicas = db.execute(
+                """
+                SELECT r.chunk_id, r.worker_id, w.url, c.checksum
+                FROM replicas r
+                JOIN workers w ON r.worker_id = w.worker_id
+                JOIN chunks c ON r.chunk_id = c.chunk_id
+                WHERE w.status = 'ALIVE'
+                """
+            )
+            for rep in replicas:
+                chunk_id = rep["chunk_id"]
+                worker_id = rep["worker_id"]
+                url = rep["url"]
+                expected = rep["checksum"]
+                try:
+                    with httpx.Client(timeout=5.0) as client:
+                        res = client.get(f"{url}/internal/chunks/{chunk_id}/checksum")
+                    if res.status_code == 404:
+                        db.execute(
+                            "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
+                            (chunk_id, worker_id), commit=True,
+                        )
+                        print(
+                            f"[controller] event=corruption_detected "
+                            f"chunk_id={chunk_id} worker_id={worker_id} reason=missing"
+                        )
+                        continue
+                    if res.status_code != 200:
+                        continue
+                    actual = res.json().get("sha256", "")
+                    if actual != expected:
+                        db.execute(
+                            "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
+                            (chunk_id, worker_id), commit=True,
+                        )
+                        print(
+                            f"[controller] event=corruption_detected "
+                            f"chunk_id={chunk_id} worker_id={worker_id} reason=checksum_mismatch"
+                        )
+                except Exception as exc:
+                    print(
+                        f"[controller] event=scrub_error "
+                        f"chunk_id={chunk_id} worker_id={worker_id} error={exc}"
+                    )
+
+            # Prune excess replicas so no chunk exceeds REPLICATION live copies
+            over_replicated = db.execute(
+                """
+                SELECT c.chunk_id, COUNT(r.worker_id) AS live_count
+                FROM chunks c
+                JOIN replicas r ON c.chunk_id = r.chunk_id
+                JOIN workers w ON r.worker_id = w.worker_id
+                WHERE w.status = 'ALIVE'
+                GROUP BY c.chunk_id
+                HAVING live_count > ?
+                """,
+                (REPLICATION,),
+            )
+            for row in over_replicated:
+                cid = row["chunk_id"]
+                excess_count = row["live_count"] - REPLICATION
+                excess_reps = db.execute(
+                    """
+                    SELECT r.worker_id, w.url
+                    FROM replicas r
+                    JOIN workers w ON r.worker_id = w.worker_id
+                    WHERE r.chunk_id = ? AND w.status = 'ALIVE'
+                    ORDER BY r.worker_id DESC
+                    LIMIT ?
+                    """,
+                    (cid, excess_count),
+                )
+                for rep in excess_reps:
+                    try:
+                        with httpx.Client(timeout=5.0) as client:
+                            client.delete(f"{rep['url']}/internal/chunks/{cid}")
+                    except Exception as exc:
+                        print(f"[controller] event=excess_delete_failed chunk_id={cid} worker_id={rep['worker_id']} error={exc}")
+                    db.execute(
+                        "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
+                        (cid, rep["worker_id"]),
+                        commit=True,
+                    )
+                    print(f"[controller] event=excess_replica_removed chunk_id={cid} worker_id={rep['worker_id']}")
+        except Exception as exc:
+            print(f"[controller] event=scrubber_error error={exc}")
+
+
+def start_scrubber():
+    """Start the background scrubber thread."""
+    t = threading.Thread(target=_scrub_loop, daemon=True)
     t.start()

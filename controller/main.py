@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ app = FastAPI()
 def on_startup():
     db.init_db()
     repair.start_monitor()
+    repair.start_scrubber()
 
 
 # --------------- models ---------------
@@ -68,6 +70,76 @@ def register_worker(req: RegisterRequest):
             commit=True,
         )
     print(f"[controller] event=worker_registered worker_id={req.worker_id}")
+
+    # Snapshot inventory for RECONCILE
+    inventory_chunk_ids = {c["chunk_id"] for c in req.chunks}
+    worker_id = req.worker_id
+    worker_url = req.url
+
+    # RECONCILE: run in background thread so we can respond 200 immediately
+    def _reconcile():
+        # (a) chunk_id in inventory but NOT in chunks table → orphan → DELETE from worker
+        orphans = [cid for cid in inventory_chunk_ids if not db.execute(
+            "SELECT 1 FROM chunks WHERE chunk_id = ?", (cid,)
+        )]
+        if orphans:
+            with httpx.Client(timeout=5.0) as client:
+                for cid in orphans:
+                    try:
+                        client.delete(f"{worker_url}/internal/chunks/{cid}")
+                        print(
+                            f"[controller] event=orphan_deleted "
+                            f"worker_id={worker_id} chunk_id={cid}"
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[controller] event=orphan_delete_failed "
+                            f"worker_id={worker_id} chunk_id={cid} error={exc}"
+                        )
+
+        # (b) chunk_id in chunks table, in inventory, but no replica row for this worker
+        #     → insert replica row (only for COMPLETE objects)
+        if inventory_chunk_ids:
+            placeholders = ",".join("?" * len(inventory_chunk_ids))
+            known = db.execute(
+                f"SELECT c.chunk_id FROM chunks c "
+                f"JOIN objects o ON c.object_id = o.object_id "
+                f"WHERE c.chunk_id IN ({placeholders}) "
+                f"AND o.status = 'COMPLETE' "
+                f"AND c.chunk_id NOT IN ("
+                f"  SELECT chunk_id FROM replicas WHERE worker_id = ?"
+                f")",
+                tuple(inventory_chunk_ids) + (worker_id,),
+            )
+            for row in known:
+                db.execute(
+                    "INSERT OR IGNORE INTO replicas (chunk_id, worker_id) VALUES (?, ?)",
+                    (row["chunk_id"], worker_id),
+                    commit=True,
+                )
+                print(
+                    f"[controller] event=replica_restored "
+                    f"worker_id={worker_id} chunk_id={row['chunk_id']}"
+                )
+
+        # (c) replica rows for this worker whose chunk is NOT in the inventory → delete rows
+        stale = db.execute(
+            "SELECT chunk_id FROM replicas WHERE worker_id = ?",
+            (worker_id,),
+        )
+        for row in stale:
+            if row["chunk_id"] not in inventory_chunk_ids:
+                db.execute(
+                    "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
+                    (row["chunk_id"], worker_id),
+                    commit=True,
+                )
+                print(
+                    f"[controller] event=stale_replica_removed "
+                    f"worker_id={worker_id} chunk_id={row['chunk_id']}"
+                )
+
+    threading.Thread(target=_reconcile, daemon=True).start()
     return {"status": "ok"}
 
 
@@ -366,33 +438,72 @@ def _get_object_or_error(object_id: str):
 def _fetch_chunk_verified(chunk_row) -> bytes | None:
     """
     Try each ALIVE replica for this chunk; return verified bytes or None.
+    Implements READ-REPAIR: on checksum mismatch logs corruption_detected,
+    falls back to the next replica, then overwrites the bad replica with
+    good bytes and logs corruption_repaired.
     """
+    chunk_id = chunk_row["chunk_id"]
+    expected = chunk_row["checksum"]
+
     replicas = db.execute(
-        "SELECT r.worker_id, w.url, w.status "
+        "SELECT r.worker_id, w.url "
         "FROM replicas r JOIN workers w ON r.worker_id = w.worker_id "
         "WHERE r.chunk_id = ? AND w.status = 'ALIVE'",
-        (chunk_row["chunk_id"],),
+        (chunk_id,),
     )
+
+    bad_replicas: list[dict] = []
+    good_data: bytes | None = None
+
     for rep in replicas:
         try:
             with httpx.Client(timeout=10.0) as client:
-                res = client.get(f"{rep['url']}/internal/chunks/{chunk_row['chunk_id']}")
+                res = client.get(f"{rep['url']}/internal/chunks/{chunk_id}")
             if res.status_code != 200:
                 continue
             data = res.content
-            if hashlib.sha256(data).hexdigest() == chunk_row["checksum"]:
-                return data
+            if hashlib.sha256(data).hexdigest() == expected:
+                good_data = data
+                break
             else:
                 print(
                     f"[controller] event=corruption_detected "
-                    f"chunk_id={chunk_row['chunk_id']} worker_id={rep['worker_id']}"
+                    f"chunk_id={chunk_id} worker_id={rep['worker_id']}"
                 )
+                bad_replicas.append(dict(rep))
         except Exception as exc:
             print(
                 f"[controller] event=chunk_fetch_failed "
-                f"chunk_id={chunk_row['chunk_id']} worker_id={rep['worker_id']} error={exc}"
+                f"chunk_id={chunk_id} worker_id={rep['worker_id']} error={exc}"
             )
-    return None
+
+    if good_data is None:
+        return None
+
+    # READ-REPAIR: overwrite each bad replica with verified good bytes
+    for bad in bad_replicas:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.put(
+                    f"{bad['url']}/internal/chunks/{chunk_id}",
+                    content=good_data,
+                    headers={
+                        "X-Checksum-SHA256": expected,
+                        "Content-Type": "application/octet-stream",
+                    },
+                )
+            if r.status_code == 201:
+                print(
+                    f"[controller] event=corruption_repaired "
+                    f"chunk_id={chunk_id} worker_id={bad['worker_id']}"
+                )
+        except Exception as exc:
+            print(
+                f"[controller] event=read_repair_failed "
+                f"chunk_id={chunk_id} worker_id={bad['worker_id']} error={exc}"
+            )
+
+    return good_data
 
 
 # --------------- Task 5: GET /api/v1/objects/{object_id} ---------------
