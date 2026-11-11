@@ -29,6 +29,8 @@ def _inventory() -> list[dict]:
     items = []
     if os.path.isdir(CHUNKS_DIR):
         for name in os.listdir(CHUNKS_DIR):
+            if name.startswith("tmp") or name.startswith("."):
+                continue
             path = os.path.join(CHUNKS_DIR, name)
             if os.path.isfile(path):
                 items.append({"chunk_id": name, "size": os.path.getsize(path)})
@@ -114,14 +116,18 @@ def put_chunk(
     path = _chunk_path(chunk_id)
     fd, tmp = tempfile.mkstemp(dir=CHUNKS_DIR)
     try:
-        os.write(fd, body)
-        os.fsync(fd)
-        os.close(fd)
+        try:
+            os.write(fd, body)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
     except Exception:
-        os.close(fd) if not os.get_inheritable(fd) else None
         if os.path.exists(tmp):
-            os.remove(tmp)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         raise
 
     print(f"[worker] event=chunk_stored worker_id={WORKER_ID} chunk_id={chunk_id} size={len(body)}")
@@ -131,14 +137,15 @@ def put_chunk(
 @app.get("/internal/chunks/{chunk_id}")
 def get_chunk(chunk_id: str):
     path = _chunk_path(chunk_id)
-    if not os.path.isfile(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, IsADirectoryError):
         return Response(
             status_code=404,
             media_type="application/json",
             content='{"error":{"code":"CHUNK_NOT_FOUND","message":"chunk not found"}}',
         )
-    with open(path, "rb") as f:
-        data = f.read()
     return Response(content=data, media_type="application/octet-stream")
 
 
@@ -155,21 +162,22 @@ def delete_chunk(chunk_id: str):
 @app.get("/internal/chunks/{chunk_id}/checksum")
 def get_checksum(chunk_id: str):
     path = _chunk_path(chunk_id)
-    if not os.path.isfile(path):
+    h = hashlib.sha256()
+    size = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                block = f.read(65536)
+                if not block:
+                    break
+                h.update(block)
+                size += len(block)
+    except (FileNotFoundError, IsADirectoryError):
         return Response(
             status_code=404,
             media_type="application/json",
             content='{"error":{"code":"CHUNK_NOT_FOUND","message":"chunk not found"}}',
         )
-    h = hashlib.sha256()
-    size = 0
-    with open(path, "rb") as f:
-        while True:
-            block = f.read(65536)
-            if not block:
-                break
-            h.update(block)
-            size += len(block)
     return {"sha256": h.hexdigest(), "size": size}
 
 

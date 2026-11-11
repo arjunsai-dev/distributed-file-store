@@ -73,21 +73,22 @@ def rollback_upload(object_id: str, placed_tracker: list):
     Best-effort rollback: DELETE placed chunks from currently ALIVE workers
     and remove object/chunk/replica rows under lock.
     """
-    alive_rows = db.execute("SELECT worker_id, url FROM workers WHERE status = 'ALIVE'")
-    alive_map = {r["worker_id"]: r["url"] for r in alive_rows}
+    with db._lock:
+        alive_rows = db.execute("SELECT worker_id, url FROM workers WHERE status = 'ALIVE'")
+        alive_map = {r["worker_id"]: r["url"] for r in alive_rows}
 
-    with httpx.Client(timeout=3.0) as client:
-        for item in placed_tracker:
-            w_id = item["worker_id"]
-            if w_id in alive_map:
-                url = item.get("url") or alive_map[w_id]
-                try:
-                    client.delete(f"{url}/internal/chunks/{item['chunk_id']}")
-                except Exception as exc:
-                    print(f"[controller] event=rollback_delete_failed worker_id={w_id} chunk_id={item['chunk_id']} error={exc}")
+        with httpx.Client(timeout=3.0) as client:
+            for item in placed_tracker:
+                w_id = item["worker_id"]
+                if w_id in alive_map:
+                    url = item.get("url") or alive_map[w_id]
+                    try:
+                        client.delete(f"{url}/internal/chunks/{item['chunk_id']}")
+                    except Exception as exc:
+                        print(f"[controller] event=rollback_delete_failed worker_id={w_id} chunk_id={item['chunk_id']} error={exc}")
 
-    db.execute_many([
-        ("DELETE FROM replicas WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE object_id = ?)", (object_id,)),
-        ("DELETE FROM chunks WHERE object_id = ?", (object_id,)),
-        ("DELETE FROM objects WHERE object_id = ?", (object_id,)),
-    ], commit=True)
+        db.execute_many([
+            ("DELETE FROM replicas WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE object_id = ?)", (object_id,)),
+            ("DELETE FROM chunks WHERE object_id = ?", (object_id,)),
+            ("DELETE FROM objects WHERE object_id = ?", (object_id,)),
+        ], commit=True)

@@ -2,7 +2,7 @@ import sqlite3
 import threading
 
 DB_PATH = "/data/controller.db"
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def _connect() -> sqlite3.Connection:

@@ -10,8 +10,6 @@ from config import DEAD_AFTER, REPAIR_INTERVAL, REPLICATION, SCRUB_INTERVAL
 
 _repair_lock = threading.Lock()
 
-_repair_lock = threading.Lock()
-
 
 def repair_under_replicated():
     """
@@ -101,6 +99,7 @@ def repair_under_replicated():
                             continue
                         chk_data = r_chk.json()
                         if chk_data.get("sha256") != expected_checksum:
+                            db.execute("DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?", (chunk_id, src_id), commit=True)
                             print(f"[controller] event=corruption_detected chunk_id={chunk_id} worker_id={src_id}")
                             continue
                     except Exception as exc:
@@ -116,6 +115,7 @@ def repair_under_replicated():
                             continue
                         data = r_get.content
                         if hashlib.sha256(data).hexdigest() != expected_checksum:
+                            db.execute("DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?", (chunk_id, src_id), commit=True)
                             print(f"[controller] event=corruption_detected chunk_id={chunk_id} worker_id={src_id}")
                             continue
 
@@ -150,8 +150,12 @@ def repair_under_replicated():
                             )
                         if r_put.status_code == 201:
                             db.execute(
-                                "INSERT OR IGNORE INTO replicas (chunk_id, worker_id) VALUES (?, ?)",
-                                (chunk_id, target_id),
+                                """
+                                INSERT OR IGNORE INTO replicas (chunk_id, worker_id)
+                                SELECT ?, ?
+                                WHERE EXISTS (SELECT 1 FROM chunks WHERE chunk_id = ?)
+                                """,
+                                (chunk_id, target_id, chunk_id),
                                 commit=True,
                             )
                             print(f"[controller] event=repair_done chunk_id={chunk_id} target={target_id}")
@@ -223,7 +227,8 @@ def _scrub_loop():
                 FROM replicas r
                 JOIN workers w ON r.worker_id = w.worker_id
                 JOIN chunks c ON r.chunk_id = c.chunk_id
-                WHERE w.status = 'ALIVE'
+                JOIN objects o ON c.object_id = o.object_id
+                WHERE w.status = 'ALIVE' AND o.status = 'COMPLETE'
                 """
             )
             for rep in replicas:
@@ -269,7 +274,8 @@ def _scrub_loop():
                 FROM chunks c
                 JOIN replicas r ON c.chunk_id = r.chunk_id
                 JOIN workers w ON r.worker_id = w.worker_id
-                WHERE w.status = 'ALIVE'
+                JOIN objects o ON c.object_id = o.object_id
+                WHERE w.status = 'ALIVE' AND o.status = 'COMPLETE'
                 GROUP BY c.chunk_id
                 HAVING live_count > ?
                 """,
@@ -292,15 +298,16 @@ def _scrub_loop():
                 for rep in excess_reps:
                     try:
                         with httpx.Client(timeout=5.0) as client:
-                            client.delete(f"{rep['url']}/internal/chunks/{cid}")
+                            res = client.delete(f"{rep['url']}/internal/chunks/{cid}")
+                        if res.status_code in (200, 204, 404):
+                            db.execute(
+                                "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
+                                (cid, rep["worker_id"]),
+                                commit=True,
+                            )
+                            print(f"[controller] event=excess_replica_removed chunk_id={cid} worker_id={rep['worker_id']}")
                     except Exception as exc:
                         print(f"[controller] event=excess_delete_failed chunk_id={cid} worker_id={rep['worker_id']} error={exc}")
-                    db.execute(
-                        "DELETE FROM replicas WHERE chunk_id = ? AND worker_id = ?",
-                        (cid, rep["worker_id"]),
-                        commit=True,
-                    )
-                    print(f"[controller] event=excess_replica_removed chunk_id={cid} worker_id={rep['worker_id']}")
         except Exception as exc:
             print(f"[controller] event=scrubber_error error={exc}")
 

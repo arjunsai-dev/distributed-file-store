@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, File, Form, Response, UploadFile
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -45,30 +45,27 @@ class HeartbeatRequest(BaseModel):
 @app.post("/internal/workers/register")
 def register_worker(req: RegisterRequest):
     now = time.time()
-    # Upsert worker, mark ALIVE
     existing = db.execute(
         "SELECT worker_id, status FROM workers WHERE worker_id = ?",
         (req.worker_id,),
     )
-    if existing:
-        old_status = existing[0]["status"]
-        db.execute(
-            "UPDATE workers SET url = ?, last_heartbeat = ?, status = 'ALIVE' "
-            "WHERE worker_id = ?",
-            (req.url, now, req.worker_id),
-            commit=True,
-        )
-        if old_status == "DEAD":
-            print(
-                f"[controller] event=worker_alive worker_id={req.worker_id}"
-            )
-    else:
-        db.execute(
-            "INSERT INTO workers (worker_id, url, last_heartbeat, status) "
-            "VALUES (?, ?, ?, 'ALIVE')",
-            (req.worker_id, req.url, now),
-            commit=True,
-        )
+    old_status = existing[0]["status"] if existing else None
+
+    # Upsert worker atomically, mark ALIVE
+    db.execute(
+        """
+        INSERT INTO workers (worker_id, url, last_heartbeat, status)
+        VALUES (?, ?, ?, 'ALIVE')
+        ON CONFLICT(worker_id) DO UPDATE SET
+            url = excluded.url,
+            last_heartbeat = excluded.last_heartbeat,
+            status = 'ALIVE'
+        """,
+        (req.worker_id, req.url, now),
+        commit=True,
+    )
+    if old_status == "DEAD":
+        print(f"[controller] event=worker_alive worker_id={req.worker_id}")
     print(f"[controller] event=worker_registered worker_id={req.worker_id}")
 
     # Snapshot inventory for RECONCILE
@@ -79,9 +76,16 @@ def register_worker(req: RegisterRequest):
     # RECONCILE: run in background thread so we can respond 200 immediately
     def _reconcile():
         # (a) chunk_id in inventory but NOT in chunks table → orphan → DELETE from worker
-        orphans = [cid for cid in inventory_chunk_ids if not db.execute(
-            "SELECT 1 FROM chunks WHERE chunk_id = ?", (cid,)
-        )]
+        # Skip chunks whose parent object is currently UPLOADING
+        orphans = []
+        for cid in inventory_chunk_ids:
+            chunk_exists = db.execute("SELECT 1 FROM chunks WHERE chunk_id = ?", (cid,))
+            if not chunk_exists:
+                obj_prefix = cid.rsplit("_", 1)[0]
+                obj_uploading = db.execute("SELECT 1 FROM objects WHERE object_id = ? AND status = 'UPLOADING'", (obj_prefix,))
+                if not obj_uploading:
+                    orphans.append(cid)
+
         if orphans:
             with httpx.Client(timeout=5.0) as client:
                 for cid in orphans:
@@ -122,9 +126,14 @@ def register_worker(req: RegisterRequest):
                     f"worker_id={worker_id} chunk_id={row['chunk_id']}"
                 )
 
-        # (c) replica rows for this worker whose chunk is NOT in the inventory → delete rows
+        # (c) replica rows for this worker whose chunk is NOT in the inventory → delete rows (for COMPLETE objects)
         stale = db.execute(
-            "SELECT chunk_id FROM replicas WHERE worker_id = ?",
+            """
+            SELECT r.chunk_id FROM replicas r
+            JOIN chunks c ON r.chunk_id = c.chunk_id
+            JOIN objects o ON c.object_id = o.object_id
+            WHERE r.worker_id = ? AND o.status = 'COMPLETE'
+            """,
             (worker_id,),
         )
         for row in stale:
@@ -202,14 +211,16 @@ def admin_status(detail: bool = False):
         "FROM workers w",
     )
 
-    # Count under-replicated: chunks with live replicas < REPLICATION
+    # Count under-replicated: chunks with live replicas < REPLICATION (for COMPLETE objects only)
     under = db.execute(
         "SELECT COUNT(*) AS cnt FROM ("
         "  SELECT c.chunk_id, "
         "    SUM(CASE WHEN w.status = 'ALIVE' THEN 1 ELSE 0 END) AS live "
         "  FROM chunks c "
+        "  JOIN objects o ON c.object_id = o.object_id "
         "  LEFT JOIN replicas r ON c.chunk_id = r.chunk_id "
         "  LEFT JOIN workers w ON r.worker_id = w.worker_id "
+        "  WHERE o.status = 'COMPLETE' "
         "  GROUP BY c.chunk_id "
         "  HAVING live < ?"
         ")",
@@ -232,7 +243,10 @@ def admin_status(detail: bool = False):
     if detail:
         all_chunks = db.execute(
             "SELECT c.chunk_id, c.object_id, c.idx, c.size, c.checksum "
-            "FROM chunks c ORDER BY c.chunk_id",
+            "FROM chunks c "
+            "JOIN objects o ON c.object_id = o.object_id "
+            "WHERE o.status = 'COMPLETE' "
+            "ORDER BY c.chunk_id",
         )
         chunk_list = []
         for ch in all_chunks:
@@ -493,6 +507,11 @@ def _fetch_chunk_verified(chunk_row) -> bytes | None:
                     },
                 )
             if r.status_code == 201:
+                db.execute(
+                    "INSERT OR IGNORE INTO replicas (chunk_id, worker_id) VALUES (?, ?)",
+                    (chunk_id, bad["worker_id"]),
+                    commit=True,
+                )
                 print(
                     f"[controller] event=corruption_repaired "
                     f"chunk_id={chunk_id} worker_id={bad['worker_id']}"
@@ -508,6 +527,7 @@ def _fetch_chunk_verified(chunk_row) -> bytes | None:
 
 # --------------- Task 5: GET /api/v1/objects/{object_id} ---------------
 
+@app.get("/objects/{object_id}")
 @app.get("/api/v1/objects/{object_id}")
 def download_object(object_id: str):
     obj, err = _get_object_or_error(object_id)
@@ -562,6 +582,7 @@ def download_object(object_id: str):
 
 # --------------- Task 6: metadata, list, delete ---------------
 
+@app.get("/objects/{object_id}/metadata")
 @app.get("/api/v1/objects/{object_id}/metadata")
 def get_object_metadata(object_id: str):
     obj, err = _get_object_or_error(object_id)
@@ -612,40 +633,51 @@ def get_object_metadata(object_id: str):
     }
 
 
+@app.patch("/objects/{object_id}/metadata")
 @app.patch("/api/v1/objects/{object_id}/metadata")
-def patch_object_metadata(object_id: str, body: dict):
-    obj, err = _get_object_or_error(object_id)
-    if err:
-        return err
-
-    if not isinstance(body, dict):
+async def patch_object_metadata(object_id: str, request: Request):
+    body_bytes = await request.body()
+    try:
+        body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "INVALID_BODY", "message": "body must be a JSON object"}},
+            )
+    except Exception:
         return JSONResponse(
             status_code=400,
-            content={"error": {"code": "INVALID_BODY", "message": "body must be a JSON object"}},
+            content={"error": {"code": "INVALID_BODY", "message": "invalid JSON body"}},
         )
 
-    # Merge into custom_meta; null value deletes the key
-    try:
-        custom_meta = json.loads(obj["custom_meta"]) if obj["custom_meta"] else {}
-    except Exception:
-        custom_meta = {}
+    with db._lock:
+        obj, err = _get_object_or_error(object_id)
+        if err:
+            return err
 
-    for k, v in body.items():
-        if v is None:
-            custom_meta.pop(k, None)
-        else:
-            custom_meta[k] = v
+        # Merge into custom_meta; null value deletes the key
+        try:
+            custom_meta = json.loads(obj["custom_meta"]) if obj["custom_meta"] else {}
+        except Exception:
+            custom_meta = {}
 
-    modified_at = datetime.now(timezone.utc).isoformat()
-    db.execute(
-        "UPDATE objects SET custom_meta = ?, modified_at = ? WHERE object_id = ?",
-        (json.dumps(custom_meta), modified_at, object_id),
-        commit=True,
-    )
+        for k, v in body.items():
+            if v is None:
+                custom_meta.pop(k, None)
+            else:
+                custom_meta[k] = v
+
+        modified_at = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "UPDATE objects SET custom_meta = ?, modified_at = ? WHERE object_id = ?",
+            (json.dumps(custom_meta), modified_at, object_id),
+            commit=True,
+        )
 
     return {"status": "ok", "custom_meta": custom_meta, "modified_at": modified_at}
 
 
+@app.get("/objects")
 @app.get("/api/v1/objects")
 def list_objects(limit: int = 100, offset: int = 0):
     rows = db.execute(
@@ -657,6 +689,7 @@ def list_objects(limit: int = 100, offset: int = 0):
     return [dict(r) for r in rows]
 
 
+@app.delete("/objects/{object_id}", status_code=204)
 @app.delete("/api/v1/objects/{object_id}", status_code=204)
 def delete_object(object_id: str):
     rows = db.execute(
@@ -669,6 +702,11 @@ def delete_object(object_id: str):
             content={"error": {"code": "NOT_FOUND", "message": "object not found"}},
         )
     obj = rows[0]
+    if obj["status"] == "DELETING":
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "NOT_FOUND", "message": "object not found"}},
+        )
     if obj["status"] == "UPLOADING":
         return JSONResponse(
             status_code=409,
@@ -709,5 +747,7 @@ def delete_object(object_id: str):
                     f"[controller] event=delete_chunk_failed "
                     f"chunk_id={rep['chunk_id']} worker_id={rep['worker_id']} error={exc}"
                 )
+
+    return Response(status_code=204)
 
     return Response(status_code=204)
